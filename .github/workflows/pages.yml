@@ -1,0 +1,111 @@
+name: Deploy to GitHub Pages (auto-detect zip)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install unzip + inspect repo
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip
+          ls -la
+
+      - name: Pick correct ZIP (contains package.json)
+        run: |
+          set -euxo pipefail
+          CANDIDATES="$(ls -1 *.zip 2>/dev/null || true)"
+          [ -n "$CANDIDATES" ] || (echo "Nessun .zip nella root" && exit 1)
+
+          FOUND=""
+          for Z in $CANDIDATES; do
+            rm -rf tmp && mkdir tmp
+            unzip -q "$Z" -d tmp || continue
+            PKG="$(find tmp -maxdepth 6 -name package.json -print -quit || true)"
+            if [ -n "$PKG" ]; then
+              FOUND="$Z"
+              break
+            fi
+          done
+          [ -n "$FOUND" ] || (echo "Nessuno zip contiene package.json" && exit 1)
+          echo "ZIP_FILE=$FOUND" >> $GITHUB_ENV
+          echo "ZIP: $FOUND"
+
+      - name: Unzip project
+        run: |
+          set -euxo pipefail
+          rm -rf app && mkdir app
+          unzip -q "$ZIP_FILE" -d app
+
+      - name: Find app folder
+        run: |
+          set -euxo pipefail
+          APP_DIR="$(find app -maxdepth 6 -name package.json -print -quit | xargs -I{} dirname "{}")"
+          [ -n "$APP_DIR" ] || (echo "package.json non trovato dopo unzip" && exit 1)
+          echo "APP_DIR=$APP_DIR" >> $GITHUB_ENV
+          ls -la "$APP_DIR"
+
+      - name: Force static export config
+        run: |
+          set -euxo pipefail
+          mkdir -p "$APP_DIR/public"
+          touch "$APP_DIR/public/.nojekyll"
+          cat > "$APP_DIR/next.config.mjs" <<'EOF'
+          /** @type {import('next').NextConfig} */
+          const basePath = process.env.NEXT_PUBLIC_BASE_PATH || "";
+          export default {
+            reactStrictMode: true,
+            output: "export",
+            basePath,
+            assetPrefix: basePath,
+            images: { unoptimized: true },
+            trailingSlash: true,
+          };
+          EOF
+
+      - name: Install
+        run: |
+          set -euxo pipefail
+          cd "$APP_DIR"
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-fund --no-audit; fi
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          cd "$APP_DIR"
+          export NEXT_PUBLIC_BASE_PATH="/${{ github.event.repository.name }}"
+          npx next build
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.APP_DIR }}/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
